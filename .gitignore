@@ -1,0 +1,25 @@
+# Environment
+.env
+
+# Virtual environment
+.venv/
+
+# SQLite portfolio database (sandbox state, not source)
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# macOS
+.DS_Store
+
+# Streamlit
+.streamlit/
+
+# IDE
+.vscode/
+.idea/
