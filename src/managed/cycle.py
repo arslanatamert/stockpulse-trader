@@ -6,6 +6,7 @@ extra LLM call is made for sizing — the math is fully explainable.
 """
 
 import math
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
 from src.agents.buffett import BuffettAgent
@@ -84,12 +85,19 @@ def run_daily_cycle(
             # Account in EUR: convert the native quote so cash/positions stay consistent.
             price = to_eur(market_data["price"], market_data.get("currency") or "EUR")
 
+            # Run the 5 agents concurrently — each is an independent network call,
+            # so a thread pool collapses ~5 sequential calls into ~1 round-trip.
             verdicts = []
-            for name, AgentClass in agents:
-                try:
-                    verdicts.append(AgentClass().analyze(ticker, market_data))
-                except Exception as exc:  # one agent failing shouldn't sink the ticker
-                    entry["note"] = f"{name} errored: {exc}"
+            with ThreadPoolExecutor(max_workers=len(agents)) as pool:
+                futures = {
+                    pool.submit(AgentClass().analyze, ticker, market_data): name
+                    for name, AgentClass in agents
+                }
+                for future, name in futures.items():
+                    try:
+                        verdicts.append(future.result())
+                    except Exception as exc:  # one agent failing shouldn't sink the ticker
+                        entry["note"] = f"{name} errored: {exc}"
             if not verdicts:
                 entry["note"] = "All agents failed."
                 results.append(entry)

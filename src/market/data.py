@@ -47,6 +47,7 @@ def get_stock_data(ticker: str) -> dict:
     return {
         "name": info.get("longName", ticker),
         "currency": info.get("currency", "EUR"),
+        "financial_currency": info.get("financialCurrency"),
         "sector": info.get("sector", "Unknown"),
         "industry": info.get("industry", "Unknown"),
         "price": round(current_price, 2),
