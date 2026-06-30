@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dotenv import load_dotenv
 load_dotenv()
 
+import pandas as pd
 import streamlit as st
 
 from src.market.data import (
@@ -504,6 +505,21 @@ with tab_managed:
                 f"<small style='color:#666'>{r['note']}</small>",
                 unsafe_allow_html=True,
             )
+
+    # ── Performance over time ──────────────────────────────────────────
+    st.divider()
+    st.subheader("📈 Performance")
+    snaps = mp.get_snapshots()
+    if not snaps:
+        st.caption("No history yet — each daily review records a point. Run a review to start the curve.")
+    else:
+        chart_df = pd.DataFrame(snaps)
+        chart_df["timestamp"] = pd.to_datetime(chart_df["timestamp"])
+        chart_df = chart_df.set_index("timestamp").rename(columns={"total_value": "Total value"})
+        chart_df["Invested (baseline)"] = m_summary["initial_capital"]
+        st.line_chart(chart_df[["Total value", "Invested (baseline)"]], color=["#22c55e", "#9ca3af"])
+        if len(snaps) == 1:
+            st.caption("Just one data point so far — more appear with each daily review.")
 
     # ── Managed transaction history ────────────────────────────────────
     st.divider()

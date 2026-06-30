@@ -14,7 +14,7 @@ from src.agents.soros import SorosAgent
 from src.agents.lynch import LynchAgent
 from src.agents.simons import SimonsAgent
 from src.jury import jury as jury_module
-from src.market.data import get_stock_data, to_eur
+from src.market.data import get_stock_data, get_eur_quotes, to_eur
 from src.portfolio.managed import ManagedPortfolio
 
 # Single source of truth for the jury line-up (also imported by app.py).
@@ -131,6 +131,16 @@ def run_daily_cycle(
             entry["note"] = f"Data error: {exc}"
 
         results.append(entry)
+
+    # Capture an equity snapshot (EUR, at current prices) for the performance chart.
+    try:
+        held = [p["symbol"] for p in portfolio.get_positions()]
+        snap_prices = {
+            s: q["price_eur"] for s, q in get_eur_quotes(held).items() if q["price_eur"] is not None
+        } if held else {}
+        portfolio.record_snapshot(snap_prices)
+    except Exception:
+        pass
 
     portfolio.set_last_run(today)
     return {"skipped": False, "date": today, "results": results}

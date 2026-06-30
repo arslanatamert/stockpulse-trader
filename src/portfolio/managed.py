@@ -34,6 +34,13 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS snapshots (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp      TEXT NOT NULL,
+    total_value    REAL NOT NULL,
+    cash           REAL NOT NULL,
+    holdings_value REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS transactions (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp           TEXT NOT NULL,
@@ -269,6 +276,36 @@ class ManagedPortfolio:
         return result
 
     # ------------------------------------------------------------------
+    # Performance snapshots (equity curve)
+    # ------------------------------------------------------------------
+
+    def record_snapshot(self, current_prices: dict[str, float] | None = None) -> dict:
+        """Capture total value / cash / holdings at this moment for the equity curve."""
+        s = self.get_summary(current_prices)
+        conn = self._connect()
+        conn.execute(
+            "INSERT INTO snapshots (timestamp, total_value, cash, holdings_value) VALUES (?,?,?,?)",
+            (
+                datetime.now().isoformat(timespec="seconds"),
+                s["total_value"], s["cash"], s["holdings_value"],
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return s
+
+    def get_snapshots(self) -> list[dict]:
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT timestamp, total_value, cash, holdings_value FROM snapshots ORDER BY id"
+        ).fetchall()
+        conn.close()
+        return [
+            {"timestamp": r[0], "total_value": r[1], "cash": r[2], "holdings_value": r[3]}
+            for r in rows
+        ]
+
+    # ------------------------------------------------------------------
     # Watchlist
     # ------------------------------------------------------------------
 
@@ -314,6 +351,7 @@ class ManagedPortfolio:
         conn.execute("DELETE FROM positions")
         conn.execute("DELETE FROM transactions")
         conn.execute("DELETE FROM watchlist")
+        conn.execute("DELETE FROM snapshots")
         self._set_meta(conn, "initial_capital", _INITIAL_CASH)
         conn.execute("DELETE FROM meta WHERE key = 'last_run_date'")
         conn.commit()
