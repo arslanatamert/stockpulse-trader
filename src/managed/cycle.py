@@ -14,7 +14,7 @@ from src.agents.soros import SorosAgent
 from src.agents.lynch import LynchAgent
 from src.agents.simons import SimonsAgent
 from src.jury import jury as jury_module
-from src.market.data import get_stock_data
+from src.market.data import get_stock_data, to_eur
 from src.portfolio.managed import ManagedPortfolio
 
 # Single source of truth for the jury line-up (also imported by app.py).
@@ -81,7 +81,8 @@ def run_daily_cycle(
         entry = {"ticker": ticker, "action": "HOLD", "shares": 0, "executed": False, "note": ""}
         try:
             market_data = get_stock_data(ticker)
-            price = market_data["price"]
+            # Account in EUR: convert the native quote so cash/positions stay consistent.
+            price = to_eur(market_data["price"], market_data.get("currency") or "EUR")
 
             verdicts = []
             for name, AgentClass in agents:

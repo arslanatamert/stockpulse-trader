@@ -46,6 +46,7 @@ def get_stock_data(ticker: str) -> dict:
 
     return {
         "name": info.get("longName", ticker),
+        "currency": info.get("currency", "EUR"),
         "sector": info.get("sector", "Unknown"),
         "industry": info.get("industry", "Unknown"),
         "price": round(current_price, 2),
@@ -83,6 +84,47 @@ def get_stock_data(ticker: str) -> dict:
         "analyst_recommendation": info.get("recommendationKey", "N/A"),
         "business_summary": (info.get("longBusinessSummary") or "")[:400],
     }
+
+
+_FX_CACHE: dict[str, float] = {}  # process-lifetime memo; FX barely moves intraday
+
+
+def get_fx_rate(from_ccy: str, to_ccy: str = "EUR") -> float:
+    """Units of ``to_ccy`` per 1 ``from_ccy`` (e.g. USD→EUR ≈ 0.88). Falls back to 1.0."""
+    from_ccy = (from_ccy or "EUR").upper()
+    to_ccy = (to_ccy or "EUR").upper()
+    if from_ccy == to_ccy:
+        return 1.0
+    key = f"{from_ccy}{to_ccy}"
+    if key in _FX_CACHE:
+        return _FX_CACHE[key]
+
+    rate = None
+    try:  # Yahoo "{FROM}{TO}=X" quotes TO per 1 FROM
+        rate = _fi_get(yf.Ticker(f"{from_ccy}{to_ccy}=X").fast_info, "last_price")
+    except Exception:
+        rate = None
+    if not rate:  # try the inverse pair
+        try:
+            inv = _fi_get(yf.Ticker(f"{to_ccy}{from_ccy}=X").fast_info, "last_price")
+            rate = 1.0 / float(inv) if inv else None
+        except Exception:
+            rate = None
+
+    rate = float(rate) if rate else 1.0
+    _FX_CACHE[key] = rate
+    return rate
+
+
+def to_eur(amount: float | None, from_ccy: str) -> float | None:
+    """Convert an amount in ``from_ccy`` to EUR. Handles GBp (pence) and unknowns."""
+    if amount is None:
+        return None
+    ccy = from_ccy or "EUR"
+    factor = 1.0
+    if ccy == "GBp":  # London pence = GBP / 100
+        ccy, factor = "GBP", 0.01
+    return round(amount * factor * get_fx_rate(ccy, "EUR"), 2)
 
 
 def search_symbols(query: str, max_results: int = 8) -> list[dict]:
@@ -124,10 +166,13 @@ def get_quote_preview(symbol: str) -> dict | None:
     try:
         fi = yf.Ticker(symbol).fast_info
         price = _fi_get(fi, "last_price")
+        price = round(float(price), 2) if price is not None else None
+        currency = _fi_get(fi, "currency") or ""
         return {
             "symbol": symbol,
-            "price": round(float(price), 2) if price is not None else None,
-            "currency": _fi_get(fi, "currency") or "",
+            "price": price,
+            "currency": currency,
+            "price_eur": to_eur(price, currency),
             "exchange": _fi_get(fi, "exchange") or "",
         }
     except Exception:
@@ -150,6 +195,22 @@ def get_current_prices(symbols: list[str]) -> dict[str, float]:
             hist = ticker.history(period="1d")
             if not hist.empty:
                 prices[symbol] = round(float(hist["Close"].iloc[-1]), 2)
+        except Exception:
+            pass
+    return prices
+
+
+def get_current_prices_in_eur(symbols: list[str]) -> dict[str, float]:
+    """Like get_current_prices but each price is converted to EUR by its native currency."""
+    prices = {}
+    for symbol in symbols:
+        try:
+            fi = yf.Ticker(symbol).fast_info
+            price = _fi_get(fi, "last_price")
+            if price is not None:
+                eur = to_eur(round(float(price), 2), _fi_get(fi, "currency") or "EUR")
+                if eur is not None:
+                    prices[symbol] = eur
         except Exception:
             pass
     return prices

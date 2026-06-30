@@ -9,7 +9,10 @@ load_dotenv()
 
 import streamlit as st
 
-from src.market.data import get_stock_data, get_current_prices, search_symbols, get_quote_preview
+from src.market.data import (
+    get_stock_data, get_current_prices, get_current_prices_in_eur,
+    search_symbols, get_quote_preview,
+)
 from src.agents.base_agent import DEFAULT_JURY_MODEL
 from src.managed.cycle import AGENTS, run_daily_cycle
 from src.jury import jury as jury_module
@@ -88,11 +91,13 @@ def stock_search_picker(key_prefix: str, label: str = "Search company or ticker"
     quote = _cached_quote(picked["symbol"])
     if quote and quote.get("price") is not None:
         exch = picked["exchange"] or quote.get("exchange")  # prefer search's friendly name (XETRA vs GER)
-        st.success(
-            f"✓ **{picked['symbol']}** · {picked['name']} · {exch} · "
-            f"**{quote['price']:.2f} {quote.get('currency', '')}**"
-        )
-        return {**picked, "price": quote["price"], "currency": quote.get("currency", ""), "exchange": exch}
+        ccy  = quote.get("currency", "")
+        price_str = f"{quote['price']:.2f} {ccy}"
+        if ccy and ccy != "EUR" and quote.get("price_eur") is not None:
+            price_str += f" (≈ €{quote['price_eur']:.2f})"
+        st.success(f"✓ **{picked['symbol']}** · {picked['name']} · {exch} · **{price_str}**")
+        return {**picked, "price": quote["price"], "currency": ccy,
+                "price_eur": quote.get("price_eur"), "exchange": exch}
 
     st.warning(f"Selected **{picked['symbol']}** but couldn't fetch a live price — verify the symbol.")
     return {**picked, "price": None, "currency": ""}
@@ -385,7 +390,7 @@ with tab_managed:
     st.caption(
         "Seed your real holdings + €1000 cash. Each day the jury reviews every holding and your "
         "watchlist, then buys / holds / sells with auto-sized quantities. "
-        "_Prototype note: prices are taken at face value as EUR — no FX conversion._"
+        "Non-EUR stocks are converted to EUR at the current FX rate."
     )
 
     # ── On-start catch-up: run once per session if today hasn't run yet ─
@@ -400,7 +405,7 @@ with tab_managed:
     # ── Summary metrics ────────────────────────────────────────────────
     m_positions = mp.get_positions()
     m_symbols   = [p["symbol"] for p in m_positions]
-    m_prices    = get_current_prices(m_symbols) if m_symbols else {}
+    m_prices    = get_current_prices_in_eur(m_symbols) if m_symbols else {}
     m_summary   = mp.get_summary(m_prices)
 
     cols = st.columns(4)
