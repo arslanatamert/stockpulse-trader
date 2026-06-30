@@ -10,7 +10,7 @@ load_dotenv()
 import streamlit as st
 
 from src.market.data import (
-    get_stock_data, get_current_prices, get_current_prices_in_eur,
+    get_stock_data, get_current_prices, get_eur_quotes,
     search_symbols, get_quote_preview,
 )
 from src.agents.base_agent import DEFAULT_JURY_MODEL
@@ -198,18 +198,14 @@ tab_jury, tab_managed = st.tabs(["⚖️ Convene Jury", "🤖 Managed Portfolio"
 # TAB 1 — Manual "convene the jury" on a single ticker
 # ═══════════════════════════════════════════════════════════════════════
 with tab_jury:
-    # ── Ticker form ────────────────────────────────────────────────────
-    with st.form("analyze_form"):
-        col_input, col_btn = st.columns([5, 1])
-        ticker_raw = col_input.text_input(
-            "Stock ticker", placeholder="e.g. AAPL  TSLA  MSFT  NVDA  META  ALV.DE",
-            label_visibility="collapsed",
-        )
-        submitted = col_btn.form_submit_button("⚖️ Convene Jury", type="primary", use_container_width=True)
+    # ── Stock picker ───────────────────────────────────────────────────
+    jury_pick = stock_search_picker("jury", label="Search a company or ticker to analyze")
+    submitted = st.button("⚖️ Convene Jury", type="primary",
+                          disabled=jury_pick is None, key="jury_btn")
 
-    # ── Run analysis (only when form submitted) ────────────────────────
-    if submitted and ticker_raw.strip():
-        ticker = ticker_raw.strip().upper()
+    # ── Run analysis (only when a stock is picked and button clicked) ──
+    if submitted and jury_pick:
+        ticker = jury_pick["symbol"]
 
         with st.spinner(f"Fetching market data for **{ticker}**…"):
             try:
@@ -405,7 +401,8 @@ with tab_managed:
     # ── Summary metrics ────────────────────────────────────────────────
     m_positions = mp.get_positions()
     m_symbols   = [p["symbol"] for p in m_positions]
-    m_prices    = get_current_prices_in_eur(m_symbols) if m_symbols else {}
+    m_quotes    = get_eur_quotes(m_symbols) if m_symbols else {}
+    m_prices    = {s: q["price_eur"] for s, q in m_quotes.items() if q["price_eur"] is not None}
     m_summary   = mp.get_summary(m_prices)
 
     cols = st.columns(4)
@@ -443,9 +440,14 @@ with tab_managed:
             st.markdown("**Current holdings**")
             for pos in m_summary["positions"]:
                 icon = "🟢" if pos["pnl_pct"] >= 0 else "🔴"
-                with st.expander(f"{pos['symbol']}  ·  {pos['shares']} sh  ·  {icon} {pos['pnl_pct']:+.2f}%"):
+                q   = m_quotes.get(pos["symbol"], {})
+                ccy = q.get("currency", "EUR")
+                with st.expander(f"{pos['symbol']}  ·  {pos['shares']} sh  ·  {ccy}  ·  {icon} {pos['pnl_pct']:+.2f}%"):
                     st.write(f"Avg cost: **€{pos['avg_cost']:.2f}**")
-                    st.write(f"Current:  **€{pos['current_price']:.2f}**")
+                    if ccy and ccy != "EUR" and q.get("native_price") is not None:
+                        st.write(f"Current:  **€{pos['current_price']:.2f}**  ({q['native_price']:.2f} {ccy})")
+                    else:
+                        st.write(f"Current:  **€{pos['current_price']:.2f}**")
                     st.write(f"Value:    **€{pos['value']:,.2f}**")
         else:
             st.caption("No holdings yet — seed one above.")

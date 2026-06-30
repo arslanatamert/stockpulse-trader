@@ -200,20 +200,28 @@ def get_current_prices(symbols: list[str]) -> dict[str, float]:
     return prices
 
 
-def get_current_prices_in_eur(symbols: list[str]) -> dict[str, float]:
-    """Like get_current_prices but each price is converted to EUR by its native currency."""
-    prices = {}
+def get_eur_quotes(symbols: list[str]) -> dict[str, dict]:
+    """Per-symbol live quote with native price, currency, and the EUR-converted price.
+
+    Returns {symbol: {"native_price", "currency", "price_eur"}}.
+    """
+    quotes = {}
     for symbol in symbols:
         try:
             fi = yf.Ticker(symbol).fast_info
             price = _fi_get(fi, "last_price")
-            if price is not None:
-                eur = to_eur(round(float(price), 2), _fi_get(fi, "currency") or "EUR")
-                if eur is not None:
-                    prices[symbol] = eur
+            if price is None:
+                continue
+            price = round(float(price), 2)
+            ccy = _fi_get(fi, "currency") or "EUR"
+            quotes[symbol] = {
+                "native_price": price,
+                "currency": ccy,
+                "price_eur": to_eur(price, ccy),
+            }
         except Exception:
             pass
-    return prices
+    return quotes
 
 
 def _safe_round(val, digits: int = 2):
