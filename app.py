@@ -398,14 +398,9 @@ with tab_managed:
         "Non-EUR stocks are converted to EUR at the current FX rate."
     )
 
-    # ── On-start catch-up: run once per session if today hasn't run yet ─
-    if not st.session_state.get("managed_catchup_done"):
-        st.session_state["managed_catchup_done"] = True
-        if mp.get_last_run() != today and (mp.get_positions() or mp.get_watchlist()):
-            with st.spinner("Running today's jury review (catch-up)…"):
-                outcome = run_daily_cycle(mp, AGENTS, force=False)
-            if not outcome.get("skipped"):
-                st.session_state["managed_last_outcome"] = outcome
+    # No on-open catch-up: the daily review runs only via the scheduled batch
+    # job (daily_run.py at 16:00). Opening the UI just displays the latest state;
+    # use the manual "Run review now" button below to trigger an ad-hoc run.
 
     # ── Summary metrics ────────────────────────────────────────────────
     m_positions = mp.get_positions()
@@ -563,6 +558,5 @@ with tab_managed:
         if st.button("Confirm Managed Reset", type="secondary"):
             mp.reset()
             st.session_state.pop("managed_last_outcome", None)
-            st.session_state.pop("managed_catchup_done", None)
             st.success("Managed portfolio reset to €1000.")
             st.rerun()
