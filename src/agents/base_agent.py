@@ -25,6 +25,10 @@ _RESPONSE_SCHEMA = """{
 
 _PERSONALITY_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "agents")
 
+# Default jury model. Overridable per-run via the JURY_MODEL env var (set in
+# .env for background runs, or from the app's model selector for the UI session).
+DEFAULT_JURY_MODEL = "claude-haiku-4-5-20251001"
+
 
 class BaseAgent:
     def __init__(self, name: str, personality_file: str):
@@ -47,7 +51,7 @@ class BaseAgent:
         user_msg = f"Analyze {ticker} and give your verdict.\n\n{_format_market_data(ticker, market_data)}"
 
         response = self._client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=os.getenv("JURY_MODEL", DEFAULT_JURY_MODEL),
             max_tokens=512,
             system=system,
             messages=[{"role": "user", "content": user_msg}],

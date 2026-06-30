@@ -46,6 +46,7 @@ def get_stock_data(ticker: str) -> dict:
 
     return {
         "name": info.get("longName", ticker),
+        "currency": info.get("currency", "EUR"),
         "sector": info.get("sector", "Unknown"),
         "industry": info.get("industry", "Unknown"),
         "price": round(current_price, 2),
@@ -85,6 +86,107 @@ def get_stock_data(ticker: str) -> dict:
     }
 
 
+_FX_CACHE: dict[str, float] = {}  # process-lifetime memo; FX barely moves intraday
+
+
+def get_fx_rate(from_ccy: str, to_ccy: str = "EUR") -> float:
+    """Units of ``to_ccy`` per 1 ``from_ccy`` (e.g. USD→EUR ≈ 0.88). Falls back to 1.0."""
+    from_ccy = (from_ccy or "EUR").upper()
+    to_ccy = (to_ccy or "EUR").upper()
+    if from_ccy == to_ccy:
+        return 1.0
+    key = f"{from_ccy}{to_ccy}"
+    if key in _FX_CACHE:
+        return _FX_CACHE[key]
+
+    rate = None
+    try:  # Yahoo "{FROM}{TO}=X" quotes TO per 1 FROM
+        rate = _fi_get(yf.Ticker(f"{from_ccy}{to_ccy}=X").fast_info, "last_price")
+    except Exception:
+        rate = None
+    if not rate:  # try the inverse pair
+        try:
+            inv = _fi_get(yf.Ticker(f"{to_ccy}{from_ccy}=X").fast_info, "last_price")
+            rate = 1.0 / float(inv) if inv else None
+        except Exception:
+            rate = None
+
+    rate = float(rate) if rate else 1.0
+    _FX_CACHE[key] = rate
+    return rate
+
+
+def to_eur(amount: float | None, from_ccy: str) -> float | None:
+    """Convert an amount in ``from_ccy`` to EUR. Handles GBp (pence) and unknowns."""
+    if amount is None:
+        return None
+    ccy = from_ccy or "EUR"
+    factor = 1.0
+    if ccy == "GBp":  # London pence = GBP / 100
+        ccy, factor = "GBP", 0.01
+    return round(amount * factor * get_fx_rate(ccy, "EUR"), 2)
+
+
+def search_symbols(query: str, max_results: int = 8) -> list[dict]:
+    """Resolve a company name (or partial ticker) to candidate symbols.
+
+    Returns a list of {symbol, name, exchange, type}, equities/ETFs first so the
+    most likely match for a company name sits at the top.
+    """
+    query = (query or "").strip()
+    if not query:
+        return []
+    try:
+        quotes = yf.Search(query, max_results=max_results).quotes or []
+    except Exception:
+        return []
+
+    results = []
+    for q in quotes:
+        symbol = q.get("symbol")
+        if not symbol:
+            continue
+        results.append({
+            "symbol": symbol,
+            "name": q.get("longname") or q.get("shortname") or symbol,
+            "exchange": q.get("exchDisp") or q.get("exchange") or "",
+            "type": q.get("typeDisp") or q.get("quoteType") or "",
+        })
+
+    priority = {"Equity": 0, "ETF": 1}
+    results.sort(key=lambda r: priority.get(r["type"], 2))  # stable: keeps Yahoo relevance within a tier
+    return results
+
+
+def get_quote_preview(symbol: str) -> dict | None:
+    """Lightweight live quote for confirming a pick: price, currency, exchange."""
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        return None
+    try:
+        fi = yf.Ticker(symbol).fast_info
+        price = _fi_get(fi, "last_price")
+        price = round(float(price), 2) if price is not None else None
+        currency = _fi_get(fi, "currency") or ""
+        return {
+            "symbol": symbol,
+            "price": price,
+            "currency": currency,
+            "price_eur": to_eur(price, currency),
+            "exchange": _fi_get(fi, "exchange") or "",
+        }
+    except Exception:
+        return None
+
+
+def _fi_get(fast_info, key):
+    """fast_info raises KeyError for absent keys instead of returning None."""
+    try:
+        return fast_info[key]
+    except Exception:
+        return None
+
+
 def get_current_prices(symbols: list[str]) -> dict[str, float]:
     prices = {}
     for symbol in symbols:
@@ -96,6 +198,30 @@ def get_current_prices(symbols: list[str]) -> dict[str, float]:
         except Exception:
             pass
     return prices
+
+
+def get_eur_quotes(symbols: list[str]) -> dict[str, dict]:
+    """Per-symbol live quote with native price, currency, and the EUR-converted price.
+
+    Returns {symbol: {"native_price", "currency", "price_eur"}}.
+    """
+    quotes = {}
+    for symbol in symbols:
+        try:
+            fi = yf.Ticker(symbol).fast_info
+            price = _fi_get(fi, "last_price")
+            if price is None:
+                continue
+            price = round(float(price), 2)
+            ccy = _fi_get(fi, "currency") or "EUR"
+            quotes[symbol] = {
+                "native_price": price,
+                "currency": ccy,
+                "price_eur": to_eur(price, ccy),
+            }
+        except Exception:
+            pass
+    return quotes
 
 
 def _safe_round(val, digits: int = 2):
