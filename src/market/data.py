@@ -85,6 +85,63 @@ def get_stock_data(ticker: str) -> dict:
     }
 
 
+def search_symbols(query: str, max_results: int = 8) -> list[dict]:
+    """Resolve a company name (or partial ticker) to candidate symbols.
+
+    Returns a list of {symbol, name, exchange, type}, equities/ETFs first so the
+    most likely match for a company name sits at the top.
+    """
+    query = (query or "").strip()
+    if not query:
+        return []
+    try:
+        quotes = yf.Search(query, max_results=max_results).quotes or []
+    except Exception:
+        return []
+
+    results = []
+    for q in quotes:
+        symbol = q.get("symbol")
+        if not symbol:
+            continue
+        results.append({
+            "symbol": symbol,
+            "name": q.get("longname") or q.get("shortname") or symbol,
+            "exchange": q.get("exchDisp") or q.get("exchange") or "",
+            "type": q.get("typeDisp") or q.get("quoteType") or "",
+        })
+
+    priority = {"Equity": 0, "ETF": 1}
+    results.sort(key=lambda r: priority.get(r["type"], 2))  # stable: keeps Yahoo relevance within a tier
+    return results
+
+
+def get_quote_preview(symbol: str) -> dict | None:
+    """Lightweight live quote for confirming a pick: price, currency, exchange."""
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        return None
+    try:
+        fi = yf.Ticker(symbol).fast_info
+        price = _fi_get(fi, "last_price")
+        return {
+            "symbol": symbol,
+            "price": round(float(price), 2) if price is not None else None,
+            "currency": _fi_get(fi, "currency") or "",
+            "exchange": _fi_get(fi, "exchange") or "",
+        }
+    except Exception:
+        return None
+
+
+def _fi_get(fast_info, key):
+    """fast_info raises KeyError for absent keys instead of returning None."""
+    try:
+        return fast_info[key]
+    except Exception:
+        return None
+
+
 def get_current_prices(symbols: list[str]) -> dict[str, float]:
     prices = {}
     for symbol in symbols:

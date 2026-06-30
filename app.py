@@ -9,7 +9,8 @@ load_dotenv()
 
 import streamlit as st
 
-from src.market.data import get_stock_data, get_current_prices
+from src.market.data import get_stock_data, get_current_prices, search_symbols, get_quote_preview
+from src.agents.base_agent import DEFAULT_JURY_MODEL
 from src.managed.cycle import AGENTS, run_daily_cycle
 from src.jury import jury as jury_module
 from src.portfolio.sandbox import SandboxPortfolio
@@ -46,6 +47,55 @@ def get_managed_portfolio() -> ManagedPortfolio:
     return ManagedPortfolio()
 
 portfolio = get_portfolio()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_search(query: str) -> list[dict]:
+    return search_symbols(query)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_quote(symbol: str) -> dict | None:
+    return get_quote_preview(symbol)
+
+
+def stock_search_picker(key_prefix: str, label: str = "Search company or ticker") -> dict | None:
+    """Type a company name → pick from matching symbols → confirm with live price.
+
+    Returns the chosen {symbol, name, exchange, price, currency} or None. Must be
+    used OUTSIDE an st.form so the dropdown updates as you type.
+    """
+    query = st.text_input(label, key=f"{key_prefix}_query", placeholder="e.g. Allianz, NVIDIA, AAPL")
+    if not query.strip():
+        return None
+
+    results = _cached_search(query)
+    if results:
+        labels = [
+            f"{r['symbol']} — {r['name']} · {r['exchange']}" + (f" ({r['type']})" if r["type"] else "")
+            for r in results
+        ]
+        chosen = st.selectbox("Matches", labels, key=f"{key_prefix}_sel")
+        picked = results[labels.index(chosen)]
+    else:
+        # No name match — fall back to treating the input as a literal ticker.
+        probe = _cached_quote(query.strip().upper())
+        if not (probe and probe.get("price") is not None):
+            st.caption("No matches found. Check the spelling or enter an exact ticker.")
+            return None
+        picked = {"symbol": probe["symbol"], "name": probe["symbol"], "exchange": probe.get("exchange", ""), "type": ""}
+
+    quote = _cached_quote(picked["symbol"])
+    if quote and quote.get("price") is not None:
+        exch = picked["exchange"] or quote.get("exchange")  # prefer search's friendly name (XETRA vs GER)
+        st.success(
+            f"✓ **{picked['symbol']}** · {picked['name']} · {exch} · "
+            f"**{quote['price']:.2f} {quote.get('currency', '')}**"
+        )
+        return {**picked, "price": quote["price"], "currency": quote.get("currency", ""), "exchange": exch}
+
+    st.warning(f"Selected **{picked['symbol']}** but couldn't fetch a live price — verify the symbol.")
+    return {**picked, "price": None, "currency": ""}
 
 
 def render_transactions(transactions: list[dict], cur: str = "$") -> None:
@@ -113,6 +163,20 @@ with st.sidebar:
             st.session_state.pop("analysis", None)
             st.success("Portfolio reset to $100,000.")
             st.rerun()
+
+    st.divider()
+    st.subheader("⚙️ Jury Model")
+    JURY_MODELS = {
+        "Haiku 4.5 — fast & cheap":       "claude-haiku-4-5-20251001",
+        "Sonnet 4.6 — deeper reasoning":  "claude-sonnet-4-6",
+        "Opus 4.8 — deepest, costly":     "claude-opus-4-8",
+    }
+    _ids   = list(JURY_MODELS.values())
+    _cur   = os.getenv("JURY_MODEL", DEFAULT_JURY_MODEL)
+    _idx   = _ids.index(_cur) if _cur in _ids else 0
+    _label = st.selectbox("Model for all 5 agents", list(JURY_MODELS.keys()), index=_idx)
+    os.environ["JURY_MODEL"] = JURY_MODELS[_label]
+    st.caption("Applies to this app session (both tabs). Background daily runs use `JURY_MODEL` in `.env`.")
 
 # ── Header + shared API-key check ──────────────────────────────────────
 st.title("🏛️ StockPulse Trader")
@@ -355,19 +419,20 @@ with tab_managed:
     with edit_l:
         st.markdown("**➕ Seed / add a holding**")
         st.caption("Pre-owned shares. Cost basis seeds your P&L baseline; cash is untouched.")
-        with st.form("seed_form", clear_on_submit=True):
-            s_ticker = st.text_input("Ticker", placeholder="ALV.DE")
-            sc1, sc2 = st.columns(2)
-            s_shares = sc1.number_input("Shares", min_value=1, value=1, step=1)
-            s_cost   = sc2.number_input("Avg cost (€)", min_value=0.01, value=100.0, step=1.0)
-            if st.form_submit_button("Add holding", use_container_width=True):
-                if s_ticker.strip():
-                    try:
-                        mp.seed_holding(s_ticker, int(s_shares), float(s_cost))
-                        st.success(f"Seeded {int(s_shares)} × {s_ticker.strip().upper()} @ €{s_cost:.2f}")
-                        st.rerun()
-                    except ValueError as exc:
-                        st.error(str(exc))
+        seed_pick = stock_search_picker("seed")
+        sc1, sc2 = st.columns(2)
+        s_shares = sc1.number_input("Shares", min_value=1, value=1, step=1, key="seed_shares")
+        s_cost   = sc2.number_input("Avg cost (€)", min_value=0.01, value=100.0, step=1.0, key="seed_cost",
+                                    help="Your historical purchase price — not necessarily today's price shown above.")
+        if st.button("Add holding", use_container_width=True, disabled=seed_pick is None, key="seed_add"):
+            try:
+                mp.seed_holding(seed_pick["symbol"], int(s_shares), float(s_cost))
+                st.success(f"Seeded {int(s_shares)} × {seed_pick['symbol']} @ €{s_cost:.2f}")
+                for k in ("seed_query", "seed_sel"):
+                    st.session_state.pop(k, None)
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
 
         if m_summary["positions"]:
             st.markdown("**Current holdings**")
@@ -383,12 +448,12 @@ with tab_managed:
     with edit_r:
         st.markdown("**👀 Watchlist**")
         st.caption("Tickers you don't own yet. The jury may open new positions here with spare cash.")
-        with st.form("watch_form", clear_on_submit=True):
-            w_ticker = st.text_input("Add ticker", placeholder="NVDA")
-            if st.form_submit_button("Add to watchlist", use_container_width=True):
-                if w_ticker.strip():
-                    mp.add_watch(w_ticker)
-                    st.rerun()
+        watch_pick = stock_search_picker("watch")
+        if st.button("Add to watchlist", use_container_width=True, disabled=watch_pick is None, key="watch_add"):
+            mp.add_watch(watch_pick["symbol"])
+            for k in ("watch_query", "watch_sel"):
+                st.session_state.pop(k, None)
+            st.rerun()
 
         watchlist = mp.get_watchlist()
         if watchlist:
