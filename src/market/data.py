@@ -70,7 +70,7 @@ def get_stock_data(ticker: str) -> dict:
         "free_cashflow_fmt": _fmt_large_number(free_cashflow),
         "revenue": revenue,
         "revenue_fmt": _fmt_large_number(revenue),
-        "dividend_yield": _safe_pct(info.get("dividendYield")),
+        "dividend_yield": _dividend_yield_pct(info, current_price),
         "beta": _safe_round(info.get("beta")),
         "short_ratio": _safe_round(info.get("shortRatio")),
         "short_pct_float": _safe_pct(info.get("shortPercentOfFloat")),
@@ -223,6 +223,23 @@ def get_eur_quotes(symbols: list[str]) -> dict[str, dict]:
         except Exception:
             pass
     return quotes
+
+
+def _dividend_yield_pct(info: dict, price: float | None):
+    """Dividend yield as a percentage, robust to yfinance's unit changes.
+
+    yfinance flipped `dividendYield` from a fraction to a percent in recent
+    versions (so `_safe_pct` would 100× it → e.g. 167%). `dividendRate` (€/share)
+    and `trailingAnnualDividendYield` (a fraction) are stable, so derive from the
+    per-share rate when possible and fall back to the fractional yield.
+    """
+    rate = info.get("dividendRate") or info.get("trailingAnnualDividendRate")
+    if rate and price:
+        return round(float(rate) / price * 100, 2)
+    ty = info.get("trailingAnnualDividendYield")
+    if ty is not None:
+        return _safe_pct(ty)
+    return None
 
 
 def _safe_round(val, digits: int = 2):
