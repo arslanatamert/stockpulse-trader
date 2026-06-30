@@ -6,8 +6,9 @@ app is closed. It shares the same SQLite store as the app, so trades made here
 show up in the UI on next load (and vice-versa).
 
     source .venv/bin/activate
-    python daily_run.py            # no-op if today already ran
+    python daily_run.py            # Batch API (50% cheaper); no-op if today already ran
     python daily_run.py --force    # run again regardless
+    python daily_run.py --sync     # use the live synchronous path instead of batch
 
 Background scheduling on macOS (launchd) — save as
 ~/Library/LaunchAgents/com.stockpulse.daily.plist and `launchctl load` it:
@@ -23,14 +24,19 @@ Background scheduling on macOS (launchd) — save as
         <string>/ABSOLUTE/PATH/stockpulse-trader/daily_run.py</string>
       </array>
       <key>WorkingDirectory</key><string>/ABSOLUTE/PATH/stockpulse-trader</string>
-      <key>StartCalendarInterval</key><dict><key>Hour</key><integer>18</integer>
+      <key>StartCalendarInterval</key><dict><key>Hour</key><integer>16</integer>
         <key>Minute</key><integer>0</integer></dict>
       <key>StandardOutPath</key><string>/tmp/stockpulse-daily.log</string>
       <key>StandardErrorPath</key><string>/tmp/stockpulse-daily.err</string>
     </dict></plist>
 
-Cron alternative (run at 18:00 daily):
-    0 18 * * * cd /ABSOLUTE/PATH/stockpulse-trader && .venv/bin/python daily_run.py >> /tmp/stockpulse-daily.log 2>&1
+16:00 = 30 min after the US market open (10:00 ET) for a machine in Central
+Europe. launchd uses local wall-clock time, so this drifts ~1h during the two
+weeks a year when US and EU daylight saving are out of sync. Adjust the Hour for
+your own timezone if needed.
+
+Cron alternative (run at 16:00 daily):
+    0 16 * * * cd /ABSOLUTE/PATH/stockpulse-trader && .venv/bin/python daily_run.py >> /tmp/stockpulse-daily.log 2>&1
 """
 
 import os
@@ -41,7 +47,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dotenv import load_dotenv
 load_dotenv()
 
-from src.managed.cycle import AGENTS, run_daily_cycle
+from src.managed.cycle import AGENTS, run_daily_cycle, run_daily_cycle_batched
 from src.portfolio.managed import ManagedPortfolio
 
 
@@ -51,15 +57,23 @@ def main() -> int:
         print("ERROR: ANTHROPIC_API_KEY is not set. Add it to your .env file.", file=sys.stderr)
         return 1
 
-    force = "--force" in sys.argv[1:]
+    args = sys.argv[1:]
+    force = "--force" in args
+    # Batch API by default (50% cheaper, async). --sync uses the live synchronous path.
+    use_sync = "--sync" in args
     portfolio = ManagedPortfolio()
-    outcome = run_daily_cycle(portfolio, AGENTS, force=force)
+
+    if use_sync:
+        outcome = run_daily_cycle(portfolio, AGENTS, force=force)
+    else:
+        outcome = run_daily_cycle_batched(portfolio, AGENTS, force=force)
 
     if outcome["skipped"]:
         print(f"[{outcome['date']}] Already ran today — nothing to do (use --force to override).")
         return 0
 
-    print(f"[{outcome['date']}] Daily review complete. Reviewed {len(outcome['results'])} ticker(s):")
+    via = "Batch API (50% cost)" if outcome.get("via") == "batch" else "synchronous"
+    print(f"[{outcome['date']}] Daily review complete via {via}. Reviewed {len(outcome['results'])} ticker(s):")
     for r in outcome["results"]:
         flag = "✓" if r["executed"] else "·"
         conf = r.get("confidence", "—")

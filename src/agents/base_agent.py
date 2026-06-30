@@ -39,7 +39,9 @@ class BaseAgent:
         with open(path, encoding="utf-8") as fh:
             self._personality = fh.read()
 
-    def analyze(self, ticker: str, market_data: dict) -> AgentVerdict:
+    def build_params(self, ticker: str, market_data: dict) -> dict:
+        """Build the Messages-API params for this agent — shared by the sync and
+        batch paths so both produce byte-identical prompts."""
         system = (
             f"You are {self.name}, the legendary investor. "
             f"Analyze stocks strictly through your documented investment philosophy below.\n\n"
@@ -47,28 +49,30 @@ class BaseAgent:
             f"Respond ONLY with a valid JSON object matching this exact schema:\n{_RESPONSE_SCHEMA}\n"
             f"No markdown, no explanation outside the JSON."
         )
-
         user_msg = f"Analyze {ticker} and give your verdict.\n\n{_format_market_data(ticker, market_data)}"
+        return {
+            "model": os.getenv("JURY_MODEL", DEFAULT_JURY_MODEL),
+            "max_tokens": 512,
+            "system": system,
+            "messages": [{"role": "user", "content": user_msg}],
+        }
 
-        response = self._client.messages.create(
-            model=os.getenv("JURY_MODEL", DEFAULT_JURY_MODEL),
-            max_tokens=512,
-            system=system,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-
-        raw = response.content[0].text.strip()
-        raw = _strip_code_fences(raw)
-        data = json.loads(raw)
-
+    @staticmethod
+    def parse(agent_name: str, raw_text: str) -> AgentVerdict:
+        """Parse a raw model response (JSON) into an AgentVerdict."""
+        data = json.loads(_strip_code_fences(raw_text.strip()))
         return AgentVerdict(
-            agent_name=self.name,
+            agent_name=agent_name,
             action=data["action"].upper(),
             confidence=int(data["confidence"]),
             reasoning=data["reasoning"],
             key_factors=data.get("key_factors", []),
             risk_assessment=data.get("risk_assessment", ""),
         )
+
+    def analyze(self, ticker: str, market_data: dict) -> AgentVerdict:
+        response = self._client.messages.create(**self.build_params(ticker, market_data))
+        return self.parse(self.name, response.content[0].text)
 
 
 def _format_market_data(ticker: str, data: dict) -> str:

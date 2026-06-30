@@ -274,6 +274,14 @@ with tab_jury:
         st.subheader(f"{market_data['name']}  ·  {ticker}")
         st.caption(f"{market_data['sector']}  /  {market_data['industry']}")
 
+        fin_ccy = market_data.get("financial_currency")
+        if fin_ccy and fin_ccy != market_data.get("currency"):
+            st.warning(
+                f"⚠️ Price is quoted in **{market_data['currency']}**, but fundamentals "
+                f"(revenue, FCF, margins, market cap) are reported in **{fin_ccy}**. "
+                f"Cross-listed ticker — figures below mix currencies."
+            )
+
         row1 = st.columns(6)
         row1[0].metric("Price",       f"${market_data['price']:.2f}")
         row1[1].metric("P/E (TTM)",   market_data["pe_ratio"]  or "—")
