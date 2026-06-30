@@ -41,6 +41,12 @@ CREATE TABLE IF NOT EXISTS snapshots (
     cash           REAL NOT NULL,
     holdings_value REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS watchlist_snapshots (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp    TEXT NOT NULL,
+    basket_value REAL NOT NULL,
+    item_count   INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS transactions (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp           TEXT NOT NULL,
@@ -305,6 +311,24 @@ class ManagedPortfolio:
             for r in rows
         ]
 
+    def record_watchlist_snapshot(self, basket_value: float, item_count: int) -> None:
+        """Capture the combined value of the watchlist basket (separate from holdings)."""
+        conn = self._connect()
+        conn.execute(
+            "INSERT INTO watchlist_snapshots (timestamp, basket_value, item_count) VALUES (?,?,?)",
+            (datetime.now().isoformat(timespec="seconds"), basket_value, item_count),
+        )
+        conn.commit()
+        conn.close()
+
+    def get_watchlist_snapshots(self) -> list[dict]:
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT timestamp, basket_value, item_count FROM watchlist_snapshots ORDER BY id"
+        ).fetchall()
+        conn.close()
+        return [{"timestamp": r[0], "basket_value": r[1], "item_count": r[2]} for r in rows]
+
     # ------------------------------------------------------------------
     # Watchlist
     # ------------------------------------------------------------------
@@ -352,6 +376,7 @@ class ManagedPortfolio:
         conn.execute("DELETE FROM transactions")
         conn.execute("DELETE FROM watchlist")
         conn.execute("DELETE FROM snapshots")
+        conn.execute("DELETE FROM watchlist_snapshots")
         self._set_meta(conn, "initial_capital", _INITIAL_CASH)
         conn.execute("DELETE FROM meta WHERE key = 'last_run_date'")
         conn.commit()
