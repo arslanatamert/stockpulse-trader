@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dotenv import load_dotenv
 load_dotenv()
 
+import pandas as pd
 import streamlit as st
 
 from src.market.data import (
@@ -452,6 +453,11 @@ with tab_managed:
         else:
             st.caption("No holdings yet — seed one above.")
 
+        if st.button("📸 Snapshot portfolio value", use_container_width=True, key="snap_holdings"):
+            snap = mp.record_snapshot(m_prices)
+            st.success(f"Recorded portfolio value: €{snap['total_value']:,.2f}")
+            st.rerun()
+
     with edit_r:
         st.markdown("**👀 Watchlist**")
         st.caption("Tickers you don't own yet. The jury may open new positions here with spare cash.")
@@ -472,6 +478,14 @@ with tab_managed:
                     st.rerun()
         else:
             st.caption("Watchlist is empty.")
+
+        if st.button("📸 Snapshot watchlist value", use_container_width=True,
+                     disabled=not watchlist, key="snap_watch"):
+            wq = get_eur_quotes(watchlist)
+            basket = round(sum(q["price_eur"] for q in wq.values() if q["price_eur"] is not None), 2)
+            mp.record_watchlist_snapshot(basket, len(wq))
+            st.success(f"Recorded watchlist basket: €{basket:,.2f} across {len(wq)} item(s)")
+            st.rerun()
 
     st.divider()
 
@@ -504,6 +518,30 @@ with tab_managed:
                 f"<small style='color:#666'>{r['note']}</small>",
                 unsafe_allow_html=True,
             )
+
+    # ── Performance over time ──────────────────────────────────────────
+    st.divider()
+    st.subheader("📈 Performance")
+    snaps = mp.get_snapshots()
+    if not snaps:
+        st.caption("No history yet — each daily review records a point. Run a review to start the curve.")
+    else:
+        chart_df = pd.DataFrame(snaps)
+        chart_df["timestamp"] = pd.to_datetime(chart_df["timestamp"])
+        chart_df = chart_df.set_index("timestamp").rename(columns={"total_value": "Total value"})
+        chart_df["Invested (baseline)"] = m_summary["initial_capital"]
+        st.line_chart(chart_df[["Total value", "Invested (baseline)"]], color=["#22c55e", "#9ca3af"])
+        if len(snaps) == 1:
+            st.caption("Just one data point so far — more appear with each daily review.")
+
+    w_snaps = mp.get_watchlist_snapshots()
+    if w_snaps:
+        st.markdown("**👀 Watchlist basket value**")
+        st.caption("Combined current value of watchlist tickers (1 unit each), captured on demand.")
+        w_df = pd.DataFrame(w_snaps)
+        w_df["timestamp"] = pd.to_datetime(w_df["timestamp"])
+        w_df = w_df.set_index("timestamp").rename(columns={"basket_value": "Watchlist basket"})
+        st.line_chart(w_df[["Watchlist basket"]], color=["#3b82f6"])
 
     # ── Managed transaction history ────────────────────────────────────
     st.divider()
