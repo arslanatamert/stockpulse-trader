@@ -24,14 +24,19 @@ Background scheduling on macOS (launchd) — save as
         <string>/ABSOLUTE/PATH/stockpulse-trader/daily_run.py</string>
       </array>
       <key>WorkingDirectory</key><string>/ABSOLUTE/PATH/stockpulse-trader</string>
-      <key>StartCalendarInterval</key><dict><key>Hour</key><integer>18</integer>
+      <key>StartCalendarInterval</key><dict><key>Hour</key><integer>16</integer>
         <key>Minute</key><integer>0</integer></dict>
       <key>StandardOutPath</key><string>/tmp/stockpulse-daily.log</string>
       <key>StandardErrorPath</key><string>/tmp/stockpulse-daily.err</string>
     </dict></plist>
 
-Cron alternative (run at 18:00 daily):
-    0 18 * * * cd /ABSOLUTE/PATH/stockpulse-trader && .venv/bin/python daily_run.py >> /tmp/stockpulse-daily.log 2>&1
+16:00 = 30 min after the US market open (10:00 ET) for a machine in Central
+Europe. launchd uses local wall-clock time, so this drifts ~1h during the two
+weeks a year when US and EU daylight saving are out of sync. Adjust the Hour for
+your own timezone if needed.
+
+Cron alternative (run at 16:00 daily):
+    0 16 * * * cd /ABSOLUTE/PATH/stockpulse-trader && .venv/bin/python daily_run.py >> /tmp/stockpulse-daily.log 2>&1
 """
 
 import os
