@@ -15,7 +15,7 @@ from src.market.data import (
     search_symbols, get_quote_preview,
 )
 from src.agents.base_agent import DEFAULT_JURY_MODEL
-from src.managed.cycle import AGENTS, run_daily_cycle
+from src.managed.cycle import AGENTS, run_daily_cycle, fetch_benchmark_price
 from src.jury import jury as jury_module
 from src.portfolio.sandbox import SandboxPortfolio
 from src.portfolio.managed import ManagedPortfolio
@@ -531,7 +531,7 @@ with tab_managed:
             st.caption("No holdings yet — seed one above.")
 
         if st.button("📸 Snapshot portfolio value", use_container_width=True, key="snap_holdings"):
-            snap = mp.record_snapshot(m_prices)
+            snap = mp.record_snapshot(m_prices, benchmark_price=fetch_benchmark_price())
             st.success(f"Recorded portfolio value: €{snap['total_value']:,.2f}")
             st.rerun()
 
@@ -607,7 +607,32 @@ with tab_managed:
         chart_df["timestamp"] = pd.to_datetime(chart_df["timestamp"])
         chart_df = chart_df.set_index("timestamp").rename(columns={"total_value": "Total value"})
         chart_df["Invested (baseline)"] = m_summary["initial_capital"]
-        st.line_chart(chart_df[["Total value", "Invested (baseline)"]], color=["#22c55e", "#9ca3af"])
+
+        series = ["Total value", "Invested (baseline)"]
+        colors = ["#22c55e", "#9ca3af"]
+        # Benchmark comparison: index MSCI World to the portfolio's value at the
+        # first snapshot that has both, so the two lines share a starting point.
+        bench = chart_df["benchmark_price"].dropna()
+        if not bench.empty:
+            first_ts = bench.index[0]
+            scale = chart_df.loc[first_ts, "Total value"] / bench.iloc[0]
+            chart_df["MSCI World (indexed)"] = chart_df["benchmark_price"] * scale
+            series.append("MSCI World (indexed)")
+            colors.append("#3b82f6")
+            if len(bench) >= 2:
+                port_first = chart_df.loc[first_ts, "Total value"]
+                port_ret = chart_df["Total value"].iloc[-1] / port_first - 1
+                bench_ret = bench.iloc[-1] / bench.iloc[0] - 1
+                st.metric(
+                    "Alpha vs MSCI World",
+                    f"{(port_ret - bench_ret) * 100:+.2f} pp",
+                    help=(
+                        f"Portfolio {port_ret * 100:+.2f}% vs MSCI World "
+                        f"{bench_ret * 100:+.2f}% since {first_ts.date()}. "
+                        "Positive = beating the index."
+                    ),
+                )
+        st.line_chart(chart_df[series], color=colors)
         if len(snaps) == 1:
             st.caption("Just one data point so far — more appear with each daily review.")
 

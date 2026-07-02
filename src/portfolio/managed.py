@@ -36,11 +36,12 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS snapshots (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp      TEXT NOT NULL,
-    total_value    REAL NOT NULL,
-    cash           REAL NOT NULL,
-    holdings_value REAL NOT NULL
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp       TEXT NOT NULL,
+    total_value     REAL NOT NULL,
+    cash            REAL NOT NULL,
+    holdings_value  REAL NOT NULL,
+    benchmark_price REAL
 );
 CREATE TABLE IF NOT EXISTS watchlist_snapshots (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,6 +76,12 @@ class ManagedPortfolio:
         self._db = db_path
         conn = self._connect()
         conn.executescript(_DDL)
+        # DBs created before benchmark tracking lack the column (CREATE IF NOT
+        # EXISTS won't add it).
+        snap_cols = {r[1] for r in conn.execute("PRAGMA table_info(snapshots)")}
+        if "benchmark_price" not in snap_cols:
+            conn.execute("ALTER TABLE snapshots ADD COLUMN benchmark_price REAL")
+            conn.commit()
         row = conn.execute("SELECT COUNT(*) FROM cash").fetchone()
         if row[0] == 0:
             conn.execute("INSERT INTO cash (id, balance) VALUES (1, ?)", (_INITIAL_CASH,))
@@ -279,6 +286,25 @@ class ManagedPortfolio:
         conn.close()
         return derive_sold_positions(pos_rows, tx_rows)
 
+    def get_last_trade(self, symbol: str) -> dict | None:
+        """Most recent executed trade for a symbol — the jury's 'memory' of it."""
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT timestamp, action, shares, price, jury_confidence FROM transactions "
+            "WHERE symbol = ? ORDER BY id DESC LIMIT 1",
+            (symbol.strip().upper(),),
+        ).fetchone()
+        conn.close()
+        if row is None:
+            return None
+        return {
+            "timestamp": row[0],
+            "action": row[1],
+            "shares": row[2],
+            "price": row[3],
+            "confidence": row[4],
+        }
+
     def get_transactions(self) -> list[dict]:
         conn = self._connect()
         rows = conn.execute(
@@ -315,15 +341,24 @@ class ManagedPortfolio:
     # Performance snapshots (equity curve)
     # ------------------------------------------------------------------
 
-    def record_snapshot(self, current_prices: dict[str, float] | None = None) -> dict:
-        """Capture total value / cash / holdings at this moment for the equity curve."""
+    def record_snapshot(
+        self,
+        current_prices: dict[str, float] | None = None,
+        benchmark_price: float | None = None,
+    ) -> dict:
+        """Capture total value / cash / holdings at this moment for the equity curve.
+
+        ``benchmark_price`` is the EUR price of the benchmark ETF at the same
+        moment, so the UI can plot portfolio-vs-benchmark and compute alpha.
+        """
         s = self.get_summary(current_prices)
         conn = self._connect()
         conn.execute(
-            "INSERT INTO snapshots (timestamp, total_value, cash, holdings_value) VALUES (?,?,?,?)",
+            "INSERT INTO snapshots (timestamp, total_value, cash, holdings_value, benchmark_price)"
+            " VALUES (?,?,?,?,?)",
             (
                 datetime.now().isoformat(timespec="seconds"),
-                s["total_value"], s["cash"], s["holdings_value"],
+                s["total_value"], s["cash"], s["holdings_value"], benchmark_price,
             ),
         )
         conn.commit()
@@ -333,11 +368,15 @@ class ManagedPortfolio:
     def get_snapshots(self) -> list[dict]:
         conn = self._connect()
         rows = conn.execute(
-            "SELECT timestamp, total_value, cash, holdings_value FROM snapshots ORDER BY id"
+            "SELECT timestamp, total_value, cash, holdings_value, benchmark_price"
+            " FROM snapshots ORDER BY id"
         ).fetchall()
         conn.close()
         return [
-            {"timestamp": r[0], "total_value": r[1], "cash": r[2], "holdings_value": r[3]}
+            {
+                "timestamp": r[0], "total_value": r[1], "cash": r[2],
+                "holdings_value": r[3], "benchmark_price": r[4],
+            }
             for r in rows
         ]
 
