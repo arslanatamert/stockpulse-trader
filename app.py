@@ -438,6 +438,16 @@ with tab_jury:
             else:
                 st.info("Jury recommends **HOLD** — no trade executed.")
 
+    # ── Sold positions (realized) ──────────────────────────────────────
+    st.divider()
+    st.subheader("💸 Sold")
+    st.caption(
+        "Positions you've closed or trimmed in the sandbox, with realized price "
+        "gains. **Total sold** are fully exited; **Partially sold** are still open "
+        "with some shares taken off the table."
+    )
+    render_sold_positions(portfolio.get_sold_positions(), cur="$")
+
     # ── Transaction history ────────────────────────────────────────────
     st.divider()
     st.subheader("📋 Transaction History")

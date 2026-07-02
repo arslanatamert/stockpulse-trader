@@ -13,6 +13,7 @@ from datetime import datetime
 
 from src.agents.base_agent import AgentVerdict
 from src.jury.jury import JuryDecision
+from src.portfolio._sold import derive_sold_positions
 
 _DEFAULT_DB = os.path.join(os.path.dirname(__file__), "..", "..", "data", "managed_portfolio.db")
 _INITIAL_CASH = 1000.0  # EUR — fresh spending cash on top of seeded holdings
@@ -66,18 +67,6 @@ CREATE TABLE IF NOT EXISTS transactions (
     agent_key_factors   TEXT
 );
 """
-
-
-def _days_between(start_ts: str | None, end_ts: str | None) -> int:
-    """Whole days between two ISO timestamps; 0 if either is missing/unparseable."""
-    if not start_ts or not end_ts:
-        return 0
-    try:
-        start = datetime.fromisoformat(start_ts)
-        end = datetime.fromisoformat(end_ts)
-    except ValueError:
-        return 0
-    return max((end - start).days, 0)
 
 
 class ManagedPortfolio:
@@ -288,65 +277,7 @@ class ManagedPortfolio:
             "WHERE action IN ('BUY', 'SELL') ORDER BY id ASC"
         ).fetchall()
         conn.close()
-
-        held = {r[0]: r[1] for r in pos_rows}
-        pos_avg = {r[0]: r[2] for r in pos_rows}
-
-        by_symbol: dict[str, list] = {}
-        for sym, action, shares, price, ts in tx_rows:
-            by_symbol.setdefault(sym, []).append((action, shares, price, ts))
-
-        total, partial = [], []
-        for sym, txns in by_symbol.items():
-            bought = sum(s for a, s, _, _ in txns if a == "BUY")
-            sold = sum(s for a, s, _, _ in txns if a == "SELL")
-            if sold == 0:
-                continue  # never sold — still a plain holding
-
-            cur_held = held.get(sym, 0)
-            # Shares present that recorded BUYs can't explain came from a seed.
-            seed_shares = max(cur_held + sold - bought, 0)
-
-            shares = seed_shares
-            avg_cost = pos_avg.get(sym, 0.0) if seed_shares else 0.0
-            acquired = seed_shares
-            first_ts = txns[0][3]
-            last_sell_ts = None
-            realized = 0.0
-            sold_basis = 0.0
-
-            for action, s, price, ts in txns:
-                if action == "BUY":
-                    new_shares = shares + s
-                    avg_cost = (shares * avg_cost + s * price) / new_shares if new_shares else 0.0
-                    shares = new_shares
-                    acquired += s
-                else:  # SELL
-                    realized += s * (price - avg_cost)
-                    sold_basis += s * avg_cost
-                    shares = max(shares - s, 0)
-                    last_sell_ts = ts
-
-            realized_pct = (realized / sold_basis * 100) if sold_basis else 0.0
-            entry = {
-                "symbol": sym,
-                "sold_shares": sold,
-                "acquired_shares": acquired,
-                "realized_gain": round(realized, 2),
-                "realized_gain_pct": round(realized_pct, 2),
-                "first_acquired": first_ts,
-                "last_sold": last_sell_ts,
-            }
-            if cur_held > 0:
-                entry["sold_pct"] = round(min(sold / acquired * 100, 100), 1) if acquired else 0.0
-                partial.append(entry)
-            else:
-                entry["holding_days"] = _days_between(first_ts, last_sell_ts)
-                total.append(entry)
-
-        total.sort(key=lambda e: e["realized_gain"])
-        partial.sort(key=lambda e: e["realized_gain"])
-        return {"total": total, "partial": partial}
+        return derive_sold_positions(pos_rows, tx_rows)
 
     def get_transactions(self) -> list[dict]:
         conn = self._connect()
