@@ -68,6 +68,18 @@ CREATE TABLE IF NOT EXISTS transactions (
 """
 
 
+def _days_between(start_ts: str | None, end_ts: str | None) -> int:
+    """Whole days between two ISO timestamps; 0 if either is missing/unparseable."""
+    if not start_ts or not end_ts:
+        return 0
+    try:
+        start = datetime.fromisoformat(start_ts)
+        end = datetime.fromisoformat(end_ts)
+    except ValueError:
+        return 0
+    return max((end - start).days, 0)
+
+
 class ManagedPortfolio:
     def __init__(self, db_path: str = _DEFAULT_DB):
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
@@ -248,6 +260,93 @@ class ManagedPortfolio:
             "initial_cash": _INITIAL_CASH,
             "initial_capital": baseline,
         }
+
+    def get_sold_positions(self) -> dict:
+        """Derive fully-sold and partially-sold positions from trade history.
+
+        Replays each symbol's acquisitions (BUY) and disposals (SELL) in
+        chronological order using running average cost — mirroring
+        ``execute_trade``'s avg-cost math — to compute realized price gains.
+
+        Pre-owned holdings added via :meth:`seed_holding` never create a
+        transaction, so their lot is inferred from the live positions row:
+        any shares present that BUY transactions don't account for are treated
+        as a seed lot valued at the position's stored average cost.
+
+        Returns a dict with two buckets, each a list sorted by realized gain
+        (worst first, matching the getquin "Price gain" default sort):
+
+        * ``total``   — positions now fully closed (0 shares held). Each entry
+          carries ``holding_days`` (first acquisition → last sale).
+        * ``partial`` — positions still open but with some shares sold. Each
+          entry carries ``sold_pct`` (share of the acquired lot disposed of).
+        """
+        conn = self._connect()
+        pos_rows = conn.execute("SELECT symbol, shares, avg_cost FROM positions").fetchall()
+        tx_rows = conn.execute(
+            "SELECT symbol, action, shares, price, timestamp FROM transactions "
+            "WHERE action IN ('BUY', 'SELL') ORDER BY id ASC"
+        ).fetchall()
+        conn.close()
+
+        held = {r[0]: r[1] for r in pos_rows}
+        pos_avg = {r[0]: r[2] for r in pos_rows}
+
+        by_symbol: dict[str, list] = {}
+        for sym, action, shares, price, ts in tx_rows:
+            by_symbol.setdefault(sym, []).append((action, shares, price, ts))
+
+        total, partial = [], []
+        for sym, txns in by_symbol.items():
+            bought = sum(s for a, s, _, _ in txns if a == "BUY")
+            sold = sum(s for a, s, _, _ in txns if a == "SELL")
+            if sold == 0:
+                continue  # never sold — still a plain holding
+
+            cur_held = held.get(sym, 0)
+            # Shares present that recorded BUYs can't explain came from a seed.
+            seed_shares = max(cur_held + sold - bought, 0)
+
+            shares = seed_shares
+            avg_cost = pos_avg.get(sym, 0.0) if seed_shares else 0.0
+            acquired = seed_shares
+            first_ts = txns[0][3]
+            last_sell_ts = None
+            realized = 0.0
+            sold_basis = 0.0
+
+            for action, s, price, ts in txns:
+                if action == "BUY":
+                    new_shares = shares + s
+                    avg_cost = (shares * avg_cost + s * price) / new_shares if new_shares else 0.0
+                    shares = new_shares
+                    acquired += s
+                else:  # SELL
+                    realized += s * (price - avg_cost)
+                    sold_basis += s * avg_cost
+                    shares = max(shares - s, 0)
+                    last_sell_ts = ts
+
+            realized_pct = (realized / sold_basis * 100) if sold_basis else 0.0
+            entry = {
+                "symbol": sym,
+                "sold_shares": sold,
+                "acquired_shares": acquired,
+                "realized_gain": round(realized, 2),
+                "realized_gain_pct": round(realized_pct, 2),
+                "first_acquired": first_ts,
+                "last_sold": last_sell_ts,
+            }
+            if cur_held > 0:
+                entry["sold_pct"] = round(min(sold / acquired * 100, 100), 1) if acquired else 0.0
+                partial.append(entry)
+            else:
+                entry["holding_days"] = _days_between(first_ts, last_sell_ts)
+                total.append(entry)
+
+        total.sort(key=lambda e: e["realized_gain"])
+        partial.sort(key=lambda e: e["realized_gain"])
+        return {"total": total, "partial": partial}
 
     def get_transactions(self) -> list[dict]:
         conn = self._connect()

@@ -131,6 +131,65 @@ def render_transactions(transactions: list[dict], cur: str = "$") -> None:
                     col.caption(tx["agent_reasonings"][j])
 
 
+def _gain_html(abs_val: float, pct: float, cur: str = "€") -> str:
+    """Coloured price-gain cell — green up / red down — matching the getquin look."""
+    up = abs_val >= 0
+    color = "#22c55e" if up else "#ef4444"
+    arrow = "↗" if up else "↘"
+    sign = "+" if up else "-"
+    return (
+        f"<div style='text-align:right;line-height:1.3;color:{color}'>"
+        f"{sign}{cur}{abs(abs_val):,.2f}<br>"
+        f"<span style='font-size:0.85em'>{arrow} {abs(pct):.2f}%</span></div>"
+    )
+
+
+def render_sold_positions(sold: dict, cur: str = "€") -> None:
+    """getquin-style 'Sold' widget: Total sold + Partially sold tabs."""
+    total_rows   = sold.get("total", [])
+    partial_rows = sold.get("partial", [])
+    if not total_rows and not partial_rows:
+        st.caption(
+            "No sold positions yet — realized trades appear here once the jury "
+            "closes or trims a holding."
+        )
+        return
+
+    tab_total, tab_partial = st.tabs(["Total sold", "Partially sold"])
+
+    with tab_total:
+        if not total_rows:
+            st.caption("No fully-closed positions yet.")
+        else:
+            h = st.columns([3, 2, 2])
+            h[0].caption("Sold")
+            h[1].caption("Holding Period")
+            h[2].markdown("<div style='text-align:right'><small>Price gain</small></div>",
+                          unsafe_allow_html=True)
+            for e in total_rows:
+                c = st.columns([3, 2, 2])
+                c[0].markdown(f"**{e['symbol']}**")
+                c[1].markdown(f"{e['holding_days']} Days")
+                c[2].markdown(_gain_html(e["realized_gain"], e["realized_gain_pct"], cur),
+                              unsafe_allow_html=True)
+
+    with tab_partial:
+        if not partial_rows:
+            st.caption("No partially-sold positions yet.")
+        else:
+            h = st.columns([3, 2, 2])
+            h[0].caption("Sold")
+            h[1].caption("Sold Amount")
+            h[2].markdown("<div style='text-align:right'><small>Price gain</small></div>",
+                          unsafe_allow_html=True)
+            for e in partial_rows:
+                c = st.columns([3, 2, 2])
+                c[0].markdown(f"**{e['symbol']}**")
+                c[1].progress(min(e["sold_pct"] / 100, 1.0), text=f"{e['sold_pct']:g}%")
+                c[2].markdown(_gain_html(e["realized_gain"], e["realized_gain_pct"], cur),
+                              unsafe_allow_html=True)
+
+
 # ── Sidebar — sandbox portfolio (USD) ──────────────────────────────────
 with st.sidebar:
     st.title("📊 Sandbox Portfolio")
@@ -550,6 +609,16 @@ with tab_managed:
         w_df["timestamp"] = pd.to_datetime(w_df["timestamp"])
         w_df = w_df.set_index("timestamp").rename(columns={"basket_value": "Watchlist basket"})
         st.line_chart(w_df[["Watchlist basket"]], color=["#3b82f6"])
+
+    # ── Sold positions (realized) ──────────────────────────────────────
+    st.divider()
+    st.subheader("💸 Sold")
+    st.caption(
+        "Positions the jury has closed or trimmed, with realized price gains. "
+        "**Total sold** are fully exited; **Partially sold** are still open with "
+        "some shares taken off the table."
+    )
+    render_sold_positions(mp.get_sold_positions(), cur="€")
 
     # ── Managed transaction history ────────────────────────────────────
     st.divider()
