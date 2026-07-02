@@ -13,6 +13,7 @@ from datetime import datetime
 
 from src.agents.base_agent import AgentVerdict
 from src.jury.jury import JuryDecision
+from src.portfolio._sold import derive_sold_positions
 
 _DEFAULT_DB = os.path.join(os.path.dirname(__file__), "..", "..", "data", "managed_portfolio.db")
 _INITIAL_CASH = 1000.0  # EUR — fresh spending cash on top of seeded holdings
@@ -248,6 +249,35 @@ class ManagedPortfolio:
             "initial_cash": _INITIAL_CASH,
             "initial_capital": baseline,
         }
+
+    def get_sold_positions(self) -> dict:
+        """Derive fully-sold and partially-sold positions from trade history.
+
+        Replays each symbol's acquisitions (BUY) and disposals (SELL) in
+        chronological order using running average cost — mirroring
+        ``execute_trade``'s avg-cost math — to compute realized price gains.
+
+        Pre-owned holdings added via :meth:`seed_holding` never create a
+        transaction, so their lot is inferred from the live positions row:
+        any shares present that BUY transactions don't account for are treated
+        as a seed lot valued at the position's stored average cost.
+
+        Returns a dict with two buckets, each a list sorted by realized gain
+        (worst first, matching the getquin "Price gain" default sort):
+
+        * ``total``   — positions now fully closed (0 shares held). Each entry
+          carries ``holding_days`` (first acquisition → last sale).
+        * ``partial`` — positions still open but with some shares sold. Each
+          entry carries ``sold_pct`` (share of the acquired lot disposed of).
+        """
+        conn = self._connect()
+        pos_rows = conn.execute("SELECT symbol, shares, avg_cost FROM positions").fetchall()
+        tx_rows = conn.execute(
+            "SELECT symbol, action, shares, price, timestamp FROM transactions "
+            "WHERE action IN ('BUY', 'SELL') ORDER BY id ASC"
+        ).fetchall()
+        conn.close()
+        return derive_sold_positions(pos_rows, tx_rows)
 
     def get_transactions(self) -> list[dict]:
         conn = self._connect()

@@ -5,6 +5,7 @@ from datetime import datetime
 
 from src.agents.base_agent import AgentVerdict
 from src.jury.jury import JuryDecision
+from src.portfolio._sold import derive_sold_positions
 
 _DEFAULT_DB = os.path.join(os.path.dirname(__file__), "..", "..", "data", "portfolio.db")
 _INITIAL_CASH = float(os.getenv("INITIAL_CASH", "100000"))
@@ -180,6 +181,22 @@ class SandboxPortfolio:
             "positions": enriched,
             "initial_cash": _INITIAL_CASH,
         }
+
+    def get_sold_positions(self) -> dict:
+        """Realized 'sold' buckets (Total sold / Partially sold) from trade history.
+
+        Thin wrapper around :func:`derive_sold_positions`; see there for the
+        avg-cost replay details. The sandbox has no seeding, so every acquired
+        share comes from a recorded BUY.
+        """
+        conn = self._connect()
+        pos_rows = conn.execute("SELECT symbol, shares, avg_cost FROM positions").fetchall()
+        tx_rows = conn.execute(
+            "SELECT symbol, action, shares, price, timestamp FROM transactions "
+            "WHERE action IN ('BUY', 'SELL') ORDER BY id ASC"
+        ).fetchall()
+        conn.close()
+        return derive_sold_positions(pos_rows, tx_rows)
 
     def get_transactions(self) -> list[dict]:
         conn = self._connect()
