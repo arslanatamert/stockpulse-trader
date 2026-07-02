@@ -1,3 +1,7 @@
+import csv
+import io
+
+import requests
 import yfinance as yf
 
 
@@ -157,6 +161,130 @@ def search_symbols(query: str, max_results: int = 8) -> list[dict]:
     priority = {"Equity": 0, "ETF": 1}
     results.sort(key=lambda r: priority.get(r["type"], 2))  # stable: keeps Yahoo relevance within a tier
     return results
+
+
+_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+# iShares publishes a fund's *full* constituent list as a "Detailed Holdings"
+# CSV — unlike Yahoo, which only exposes the top ~10. Keyed by the tickers a
+# user is likely to search; aliases map onto a canonical fund key.
+_ISHARES_HOLDINGS_CSV = {
+    # iShares MSCI World Small Cap UCITS ETF (LSE: WLDS/WSML · Xetra: IUSN)
+    "WLDS": "https://www.ishares.com/uk/individual/en/products/296576/"
+            "ishares-msci-world-small-cap-ucits-etf/1506575576011.ajax"
+            "?fileType=csv&fileName=WLDS_holdings&dataType=fund",
+}
+_FUND_ALIASES = {
+    "WLDS": "WLDS", "WLDS.L": "WLDS", "WSML": "WLDS", "WSML.L": "WLDS",
+    "IUSN": "WLDS", "IUSN.DE": "WLDS", "IUSN.SG": "WLDS",
+}
+
+# iShares exchange name → Yahoo Finance ticker suffix. "" means US (no suffix).
+# Exchanges absent here are skipped rather than guessed at.
+_EXCH_SUFFIX = {
+    "New York Stock Exchange Inc.": "", "NASDAQ": "", "Nyse Mkt Llc": "",
+    "Tokyo Stock Exchange": ".T", "London Stock Exchange": ".L",
+    "Toronto Stock Exchange": ".TO", "Asx - All Markets": ".AX",
+    "Nasdaq Omx Nordic": ".ST", "Xetra": ".DE",
+    "Nyse Euronext - Euronext Paris": ".PA", "Tel Aviv Stock Exchange": ".TA",
+    "SIX Swiss Exchange": ".SW", "Hong Kong Exchanges And Clearing Ltd": ".HK",
+    "Borsa Italiana": ".MI", "Singapore Exchange": ".SI", "Oslo Bors Asa": ".OL",
+    "Bolsa De Madrid": ".MC", "Euronext Amsterdam": ".AS",
+    "Nyse Euronext - Euronext Brussels": ".BR",
+    "Omx Nordic Exchange Copenhagen A/S": ".CO", "Nasdaq Omx Helsinki Ltd.": ".HE",
+    "Wiener Boerse Ag": ".VI", "Nyse Euronext - Euronext Lisbon": ".LS",
+    "New Zealand Exchange Ltd": ".NZ", "Irish Stock Exchange - All Market": ".IR",
+}
+
+
+def _to_yahoo_symbol(ticker: str, exchange: str) -> str | None:
+    """Map an iShares (ticker, exchange) to a Yahoo symbol, or None if unmappable."""
+    if exchange not in _EXCH_SUFFIX:
+        return None
+    suffix = _EXCH_SUFFIX[exchange]
+    sym = ticker.strip().replace(" ", "-")  # share classes: "VOLV B" → "VOLV-B"
+    if not sym:
+        return None
+    if suffix == ".HK":  # Yahoo zero-pads HK codes to 4 digits (e.g. 522 → 0522)
+        sym = sym.zfill(4)
+    return sym + suffix
+
+
+def _parse_ishares_csv(text: str) -> list[dict]:
+    lines = text.splitlines()
+    try:
+        hdr = next(i for i, ln in enumerate(lines) if ln.startswith("Ticker,"))
+    except StopIteration:
+        return []
+
+    holdings = []
+    for row in csv.DictReader(io.StringIO("\n".join(lines[hdr:]))):
+        if (row.get("Asset Class") or "").strip() != "Equity":
+            continue  # skip cash, derivatives, FX lines
+        symbol = _to_yahoo_symbol((row.get("Ticker") or ""), (row.get("Exchange") or "").strip())
+        if not symbol:
+            continue
+        try:
+            weight = round(float((row.get("Weight (%)") or "0").replace(",", "")), 2)
+        except (TypeError, ValueError):
+            weight = None
+        holdings.append({
+            "symbol": symbol,
+            "name": (row.get("Name") or symbol).title(),
+            "weight_pct": weight,
+        })
+    return holdings
+
+
+def get_full_fund_holdings(symbol: str) -> list[dict]:
+    """Full constituent list from the fund issuer (iShares) as ``[{symbol, name,
+    weight_pct}]``, with symbols already resolved to Yahoo tickers.
+
+    Returns ``[]`` when the symbol isn't a known issuer fund or the download
+    fails — callers fall back to Yahoo's top-holdings via ``get_fund_holdings``.
+    """
+    key = _FUND_ALIASES.get((symbol or "").strip().upper())
+    if not key:
+        return []
+    try:
+        resp = requests.get(_ISHARES_HOLDINGS_CSV[key], headers={"User-Agent": _UA}, timeout=20)
+        resp.raise_for_status()
+    except Exception:
+        return []
+    return _parse_ishares_csv(resp.content.decode("utf-8-sig"))
+
+
+def get_fund_holdings(symbol: str) -> list[dict]:
+    """Top constituents of an ETF / index fund as ``[{symbol, name, weight_pct}]``.
+
+    Yahoo only publishes a fund's *top* holdings (typically ~10), so this returns
+    at most that many — not the full index. Returns ``[]`` for a non-fund symbol
+    or when Yahoo has no holdings data, so callers can use a truthy check to tell
+    whether the picked symbol is a screenable fund.
+    """
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        return []
+    try:
+        th = yf.Ticker(symbol).funds_data.top_holdings
+    except Exception:
+        return []
+    if th is None or len(th) == 0:
+        return []
+
+    holdings = []
+    for sym, row in th.iterrows():
+        try:
+            weight = round(float(row.get("Holding Percent", 0)) * 100, 2)
+        except (TypeError, ValueError):
+            weight = None
+        holdings.append({
+            "symbol": str(sym),
+            "name": row.get("Name") or str(sym),
+            "weight_pct": weight,
+        })
+    return holdings
 
 
 def get_quote_preview(symbol: str) -> dict | None:
