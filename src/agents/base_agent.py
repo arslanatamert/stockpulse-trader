@@ -39,9 +39,15 @@ class BaseAgent:
         with open(path, encoding="utf-8") as fh:
             self._personality = fh.read()
 
-    def build_params(self, ticker: str, market_data: dict) -> dict:
+    def build_params(
+        self, ticker: str, market_data: dict, portfolio_context: dict | None = None
+    ) -> dict:
         """Build the Messages-API params for this agent — shared by the sync and
-        batch paths so both produce byte-identical prompts."""
+        batch paths so both produce byte-identical prompts.
+
+        ``portfolio_context`` (managed-portfolio runs only) tells the agent what
+        position we already hold and what the last trade was, so verdicts are
+        made from the actual starting position instead of in a vacuum."""
         system = (
             f"You are {self.name}, the legendary investor. "
             f"Analyze stocks strictly through your documented investment philosophy below.\n\n"
@@ -50,6 +56,8 @@ class BaseAgent:
             f"No markdown, no explanation outside the JSON."
         )
         user_msg = f"Analyze {ticker} and give your verdict.\n\n{_format_market_data(ticker, market_data)}"
+        if portfolio_context:
+            user_msg += f"\n\n{_format_portfolio_context(portfolio_context)}"
         return {
             "model": os.getenv("JURY_MODEL", DEFAULT_JURY_MODEL),
             "max_tokens": 512,
@@ -70,8 +78,12 @@ class BaseAgent:
             risk_assessment=data.get("risk_assessment", ""),
         )
 
-    def analyze(self, ticker: str, market_data: dict) -> AgentVerdict:
-        response = self._client.messages.create(**self.build_params(ticker, market_data))
+    def analyze(
+        self, ticker: str, market_data: dict, portfolio_context: dict | None = None
+    ) -> AgentVerdict:
+        response = self._client.messages.create(
+            **self.build_params(ticker, market_data, portfolio_context)
+        )
         return self.parse(self.name, response.content[0].text)
 
 
@@ -84,6 +96,29 @@ def _format_market_data(ticker: str, data: dict) -> str:
         lines.append(f"{key.replace('_', ' ').title()}: {value}")
     if data.get("business_summary"):
         lines.append(f"\nBusiness: {data['business_summary']}")
+    return "\n".join(lines)
+
+
+def _format_portfolio_context(ctx: dict) -> str:
+    lines = ["Our portfolio's position in this stock:"]
+    if ctx.get("held_shares"):
+        lines.append(
+            f"- We hold {ctx['held_shares']} shares at an average cost of "
+            f"€{ctx['avg_cost']:.2f} (unrealized P&L {ctx['unrealized_pnl_pct']:+.1f}%)."
+        )
+    else:
+        lines.append("- We do not currently hold this stock.")
+    lt = ctx.get("last_trade")
+    if lt:
+        conf = f" with {lt['confidence']:.0f}% jury confidence" if lt.get("confidence") else ""
+        lines.append(
+            f"- Our last trade in it: {lt['action']} {lt['shares']} shares @ "
+            f"€{lt['price']:.2f} on {lt['date']}{conf}."
+        )
+    lines.append(
+        "- Judge from this starting position: BUY means add to it, SELL means reduce it. "
+        "Do not reverse a recent decision unless the data gives a concrete new reason."
+    )
     return "\n".join(lines)
 
 

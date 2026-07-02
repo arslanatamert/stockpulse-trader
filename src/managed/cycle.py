@@ -22,6 +22,7 @@ from src.agents.soros import SorosAgent
 from src.agents.lynch import LynchAgent
 from src.agents.simons import SimonsAgent
 from src.jury import jury as jury_module
+from src.jury.jury import JuryDecision
 from src.market.data import get_stock_data, get_eur_quotes, to_eur
 from src.portfolio.managed import ManagedPortfolio
 
@@ -36,6 +37,22 @@ AGENTS = [
 
 # Buys never deploy more than this share of free cash in one go.
 _MAX_BUY_FRACTION = 0.40
+
+# ── Invested-fraction floor ─────────────────────────────────────────────
+# Idle cash loses to the index by default, so after each cycle any cash above
+# this buffer is swept into a broad MSCI World ETF. The ETF acts as the
+# portfolio's "default position": the jury never votes on it, and the buffer
+# is what remains available for the jury's own stock picks.
+_CASH_BUFFER_FRACTION = 0.10
+BENCHMARK_ETF = os.getenv("BENCHMARK_ETF", "IWDA.AS")  # iShares Core MSCI World, EUR
+
+# ── Trade cooldown (hysteresis) ─────────────────────────────────────────
+# A stateless daily vote re-reaches yesterday's verdict and re-sizes it as a
+# fraction of what's left, salami-slicing positions over days. After an
+# executed trade a ticker is not re-reviewed until either the cooldown passes
+# or the price moves enough to constitute new information.
+_TRADE_COOLDOWN_DAYS = 5
+_COOLDOWN_BREAK_MOVE_PCT = 5.0
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -62,6 +79,103 @@ def size_trade(action: str, confidence: float, cash: float, price: float, held_s
         return int(round(frac * held_shares))
 
     return 0  # HOLD
+
+
+def fetch_benchmark_price() -> float | None:
+    """Current EUR price of the benchmark ETF (None if the quote fails)."""
+    quote = get_eur_quotes([BENCHMARK_ETF]).get(BENCHMARK_ETF)
+    return quote["price_eur"] if quote else None
+
+
+def _cooldown_note(last_trade: dict | None, price_now: float, today: str) -> str | None:
+    """Skip-note if the ticker traded recently and the price hasn't moved — else None."""
+    if not last_trade:
+        return None
+    try:
+        traded = date.fromisoformat(last_trade["timestamp"][:10])
+        days_ago = (date.fromisoformat(today) - traded).days
+    except ValueError:
+        return None
+    if days_ago >= _TRADE_COOLDOWN_DAYS:
+        return None
+    ref = last_trade["price"]
+    move_pct = abs(price_now / ref - 1) * 100 if ref else 100.0
+    if move_pct >= _COOLDOWN_BREAK_MOVE_PCT:
+        return None
+    return (
+        f"Cooldown — {last_trade['action']} executed {days_ago}d ago, "
+        f"price moved only {move_pct:.1f}% since."
+    )
+
+
+def _portfolio_context(positions: dict, ticker: str, price_eur: float,
+                       last_trade: dict | None) -> dict:
+    """Position + trade-history context handed to each agent's prompt."""
+    pos = positions.get(ticker)
+    ctx: dict = {"held_shares": 0}
+    if pos and pos["avg_cost"]:
+        ctx = {
+            "held_shares": pos["shares"],
+            "avg_cost": pos["avg_cost"],
+            "unrealized_pnl_pct": (price_eur - pos["avg_cost"]) / pos["avg_cost"] * 100,
+        }
+    if last_trade:
+        ctx["last_trade"] = {
+            "action": last_trade["action"],
+            "shares": last_trade["shares"],
+            "price": last_trade["price"],
+            "date": last_trade["timestamp"][:10],
+            "confidence": last_trade["confidence"],
+        }
+    return ctx
+
+
+def _sweep_excess_cash(portfolio, prices: dict[str, float], results: list[dict]) -> None:
+    """Buy the benchmark ETF with any cash above the buffer fraction of equity."""
+    price_map = dict(prices)
+    if BENCHMARK_ETF not in price_map:
+        bench = fetch_benchmark_price()
+        if bench is not None:
+            price_map[BENCHMARK_ETF] = bench
+    bench_price = price_map.get(BENCHMARK_ETF)
+    if not bench_price or bench_price <= 0:
+        return
+
+    cash = portfolio.get_cash()
+    holdings_value = sum(
+        p["shares"] * price_map.get(p["symbol"], p["avg_cost"])
+        for p in portfolio.get_positions()
+    )
+    equity = cash + holdings_value
+    excess = cash - _CASH_BUFFER_FRACTION * equity
+    shares = int(excess // bench_price)
+    if shares <= 0:
+        return
+
+    decision = JuryDecision(
+        action="BUY",
+        confidence=0.0,
+        reasoning=(
+            f"Automatic cash sweep: keep at least {1 - _CASH_BUFFER_FRACTION:.0%} of equity "
+            f"invested. Cash above the {_CASH_BUFFER_FRACTION:.0%} buffer goes into the "
+            f"MSCI World ETF ({BENCHMARK_ETF}) rather than dragging on returns."
+        ),
+        vote_summary="cash sweep (no jury vote)",
+        votes={},
+        dissenting_views=[],
+    )
+    entry = {"ticker": BENCHMARK_ETF, "action": "BUY", "shares": shares, "executed": False,
+             "note": ""}
+    try:
+        portfolio.execute_trade(
+            symbol=BENCHMARK_ETF, action="BUY", shares=shares,
+            price=bench_price, decision=decision, verdicts=[],
+        )
+        entry["executed"] = True
+        entry["note"] = f"Cash sweep → BUY {shares} @ €{bench_price:,.2f}"
+    except ValueError as exc:
+        entry["note"] = f"Cash sweep failed: {exc}"
+    results.append(entry)
 
 
 def _apply_verdicts(portfolio, ticker, verdicts, price, held, entry) -> None:
@@ -92,13 +206,16 @@ def _apply_verdicts(portfolio, ticker, verdicts, price, held, entry) -> None:
 
 
 def _record_snapshot(portfolio) -> None:
-    """Capture an equity snapshot (EUR, current prices) for the performance chart."""
+    """Capture an equity snapshot (EUR, current prices) plus the benchmark price."""
     try:
         held = [p["symbol"] for p in portfolio.get_positions()]
+        symbols = sorted(set(held) | {BENCHMARK_ETF})
         snap_prices = {
-            s: q["price_eur"] for s, q in get_eur_quotes(held).items() if q["price_eur"] is not None
-        } if held else {}
-        portfolio.record_snapshot(snap_prices)
+            s: q["price_eur"]
+            for s, q in get_eur_quotes(symbols).items()
+            if q["price_eur"] is not None
+        }
+        portfolio.record_snapshot(snap_prices, benchmark_price=snap_prices.get(BENCHMARK_ETF))
     except Exception:
         pass
 
@@ -121,22 +238,33 @@ def run_daily_cycle(
         return {"skipped": True, "reason": "already_ran_today", "date": today, "results": []}
 
     positions = {p["symbol"]: p for p in portfolio.get_positions()}
-    tickers = sorted(set(positions) | set(portfolio.get_watchlist()))
+    # The benchmark ETF is the cash-sweep reserve, not a jury matter.
+    tickers = sorted((set(positions) | set(portfolio.get_watchlist())) - {BENCHMARK_ETF})
 
     results: list[dict] = []
+    eur_price: dict[str, float] = {}
     for ticker in tickers:
         entry = {"ticker": ticker, "action": "HOLD", "shares": 0, "executed": False, "note": ""}
         try:
             market_data = get_stock_data(ticker)
             # Account in EUR: convert the native quote so cash/positions stay consistent.
             price = to_eur(market_data["price"], market_data.get("currency") or "EUR")
+            eur_price[ticker] = price
+
+            last_trade = portfolio.get_last_trade(ticker)
+            skip = _cooldown_note(last_trade, price, today)
+            if skip:
+                entry["note"] = skip
+                results.append(entry)
+                continue
+            context = _portfolio_context(positions, ticker, price, last_trade)
 
             # Run the 5 agents concurrently — each is an independent network call,
             # so a thread pool collapses ~5 sequential calls into ~1 round-trip.
             verdicts = []
             with ThreadPoolExecutor(max_workers=len(agents)) as pool:
                 futures = {
-                    pool.submit(AgentClass().analyze, ticker, market_data): name
+                    pool.submit(AgentClass().analyze, ticker, market_data, context): name
                     for name, AgentClass in agents
                 }
                 for future, name in futures.items():
@@ -157,6 +285,7 @@ def run_daily_cycle(
 
         results.append(entry)
 
+    _sweep_excess_cash(portfolio, eur_price, results)
     _record_snapshot(portfolio)
     portfolio.set_last_run(today)
     return {"skipped": False, "date": today, "results": results}
@@ -180,7 +309,8 @@ def run_daily_cycle_batched(
         return {"skipped": True, "reason": "already_ran_today", "date": today, "results": []}
 
     positions = {p["symbol"]: p for p in portfolio.get_positions()}
-    tickers = sorted(set(positions) | set(portfolio.get_watchlist()))
+    # The benchmark ETF is the cash-sweep reserve, not a jury matter.
+    tickers = sorted((set(positions) | set(portfolio.get_watchlist())) - {BENCHMARK_ETF})
 
     entries = {
         t: {"ticker": t, "action": "HOLD", "shares": 0, "executed": False, "note": ""}
@@ -200,18 +330,29 @@ def run_daily_cycle_batched(
         except Exception as exc:
             entries[ticker]["note"] = f"Data error: {exc}"
             continue
+        last_trade = portfolio.get_last_trade(ticker)
+        skip = _cooldown_note(last_trade, eur_price[ticker], today)
+        if skip:
+            entries[ticker]["note"] = skip
+            continue
+        context = _portfolio_context(positions, ticker, eur_price[ticker], last_trade)
         for name, inst in instances:
             cid = f"r{counter}"
             counter += 1
             id_map[cid] = (ticker, name)
             requests.append(Request(
                 custom_id=cid,
-                params=MessageCreateParamsNonStreaming(**inst.build_params(ticker, market_data)),
+                params=MessageCreateParamsNonStreaming(
+                    **inst.build_params(ticker, market_data, context)
+                ),
             ))
 
-    if not requests:  # nothing to review (no tickers, or every fetch failed)
+    if not requests:  # nothing to review (no tickers, every fetch failed, or all cooling down)
+        results = [entries[t] for t in tickers]
+        _sweep_excess_cash(portfolio, eur_price, results)
+        _record_snapshot(portfolio)
         portfolio.set_last_run(today)
-        return {"skipped": False, "date": today, "via": "batch", "results": [entries[t] for t in tickers]}
+        return {"skipped": False, "date": today, "via": "batch", "results": results}
 
     # ── Submit the batch and poll until it ends ──
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
@@ -252,6 +393,8 @@ def run_daily_cycle_batched(
         held = positions.get(ticker, {}).get("shares", 0)
         _apply_verdicts(portfolio, ticker, vs, eur_price[ticker], held, entries[ticker])
 
+    results = [entries[t] for t in tickers]
+    _sweep_excess_cash(portfolio, eur_price, results)
     _record_snapshot(portfolio)
     portfolio.set_last_run(today)
-    return {"skipped": False, "date": today, "via": "batch", "results": [entries[t] for t in tickers]}
+    return {"skipped": False, "date": today, "via": "batch", "results": results}
