@@ -1,5 +1,7 @@
 import os
+import random
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -12,13 +14,16 @@ import streamlit as st
 
 from src.market.data import (
     get_stock_data, get_current_prices, get_eur_quotes,
-    search_symbols, get_quote_preview,
+    search_symbols, get_quote_preview, get_fund_holdings, get_full_fund_holdings,
 )
 from src.agents.base_agent import DEFAULT_JURY_MODEL
 from src.managed.cycle import AGENTS, run_daily_cycle, fetch_benchmark_price
 from src.jury import jury as jury_module
 from src.portfolio.sandbox import SandboxPortfolio
 from src.portfolio.managed import ManagedPortfolio
+
+# Cap on how many index constituents the jury will screen in one convene.
+MAX_INDEX_STOCKS = 20
 
 # ── Page config ────────────────────────────────────────────────────────
 st.set_page_config(
@@ -61,6 +66,40 @@ def _cached_search(query: str) -> list[dict]:
 @st.cache_data(ttl=60, show_spinner=False)
 def _cached_quote(symbol: str) -> dict | None:
     return get_quote_preview(symbol)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_holdings(symbol: str) -> dict:
+    """Holdings of a fund for the index screen.
+
+    Prefers the issuer's full constituent list (``source="issuer"``); falls back
+    to Yahoo's top-~10 (``source="yahoo"``). ``holdings=[]`` ⇒ not a fund.
+    """
+    full = get_full_fund_holdings(symbol)
+    if full:
+        return {"holdings": full, "source": "issuer"}
+    return {"holdings": get_fund_holdings(symbol), "source": "yahoo"}
+
+
+def convene_jury_on(ticker: str) -> tuple[dict, list]:
+    """Fetch data and run all 5 agents concurrently on one ticker.
+
+    Returns ``(market_data, verdicts)``; a single agent failing is skipped so the
+    ticker still gets a verdict from the rest.
+    """
+    market_data = get_stock_data(ticker)
+    verdicts = []
+    with ThreadPoolExecutor(max_workers=len(AGENTS)) as pool:
+        futures = {
+            pool.submit(AgentClass().analyze, ticker, market_data): name
+            for name, AgentClass in AGENTS
+        }
+        for future in futures:
+            try:
+                verdicts.append(future.result())
+            except Exception:
+                pass
+    return market_data, verdicts
 
 
 def stock_search_picker(key_prefix: str, label: str = "Search company or ticker") -> dict | None:
@@ -258,10 +297,69 @@ tab_jury, tab_managed = st.tabs(["⚖️ Convene Jury", "🤖 Managed Portfolio"
 # TAB 1 — Manual "convene the jury" on a single ticker
 # ═══════════════════════════════════════════════════════════════════════
 with tab_jury:
-    # ── Stock picker ───────────────────────────────────────────────────
-    jury_pick = stock_search_picker("jury", label="Search a company or ticker to analyze")
-    submitted = st.button("⚖️ Convene Jury", type="primary",
-                          disabled=jury_pick is None, key="jury_btn")
+    # ── Stock / index picker ───────────────────────────────────────────
+    jury_pick = stock_search_picker(
+        "jury", label="Search a company, ticker, or index fund (e.g. WLDS) to analyze")
+
+    # A fund resolves to a non-empty holdings list → offer to screen it.
+    fund_info = _cached_holdings(jury_pick["symbol"]) if jury_pick else {"holdings": []}
+    holdings  = fund_info["holdings"]
+
+    if holdings:
+        n_screen = min(MAX_INDEX_STOCKS, len(holdings))
+        if fund_info["source"] == "issuer":
+            st.info(
+                f"**{jury_pick['symbol']}** is an index fund with **{len(holdings)}** "
+                f"constituents (full issuer list). The jury will screen **{n_screen}** of "
+                f"them, picked at random."
+            )
+        else:
+            st.info(
+                f"**{jury_pick['symbol']}** is an index fund. Yahoo exposes only its top "
+                f"**{len(holdings)}** holdings — the jury will screen **{n_screen}** of "
+                f"them, picked at random (cap {MAX_INDEX_STOCKS})."
+            )
+        screen_index = st.button(
+            f"⚖️ Convene Jury on {n_screen} holdings", type="primary", key="jury_index_btn")
+        submitted = False
+    else:
+        screen_index = False
+        submitted = st.button("⚖️ Convene Jury", type="primary",
+                              disabled=jury_pick is None, key="jury_btn")
+
+    # ── Run index screen (jury verdict on each of up to 20 constituents) ──
+    if screen_index and holdings:
+        fund = jury_pick["symbol"]
+        sample = random.sample(holdings, min(MAX_INDEX_STOCKS, len(holdings)))
+
+        results = []
+        progress = st.progress(0.0, text=f"Convening the jury across {len(sample)} holdings…")
+        for idx, h in enumerate(sample):
+            hticker = h["symbol"]
+            progress.progress(idx / len(sample),
+                              text=f"Jury reviewing **{hticker}** ({idx + 1}/{len(sample)})…")
+            try:
+                market_data, verdicts = convene_jury_on(hticker)
+            except Exception as exc:
+                results.append({"ticker": hticker, "name": h["name"], "error": str(exc)})
+                continue
+            if not verdicts:
+                results.append({"ticker": hticker, "name": h["name"], "error": "All agents failed."})
+                continue
+            results.append({
+                "ticker":      hticker,
+                "name":        market_data.get("name") or h["name"],
+                "weight_pct":  h["weight_pct"],
+                "price":       market_data["price"],
+                "currency":    market_data.get("currency", ""),
+                "verdicts":    verdicts,
+                "decision":    jury_module.deliberate(verdicts),
+            })
+        progress.empty()
+
+        st.session_state.pop("analysis", None)  # show the index screen alone
+        st.session_state["index_analysis"] = {"fund": fund, "results": results}
+        st.rerun()
 
     # ── Run analysis (only when a stock is picked and button clicked) ──
     if submitted and jury_pick:
@@ -311,6 +409,7 @@ with tab_jury:
         decision = jury_module.deliberate(verdicts)
 
         # Persist to session state so results survive the next rerun
+        st.session_state.pop("index_analysis", None)  # show the single-ticker result alone
         st.session_state["analysis"] = {
             "ticker":      ticker,
             "market_data": market_data,
@@ -319,10 +418,72 @@ with tab_jury:
         }
         st.rerun()   # clean rerun so results render from session state (no double-render)
 
+    # ── Render index screen results (survives reruns) ──────────────────
+    if "index_analysis" in st.session_state:
+        ix       = st.session_state["index_analysis"]
+        ix_res   = ix["results"]
+        scored   = [r for r in ix_res if "decision" in r]
+        errored  = [r for r in ix_res if "error" in r]
+
+        st.divider()
+        st.subheader(f"⚖️ Jury Screen · {ix['fund']}")
+        st.caption(f"{len(scored)} holdings analyzed"
+                   + (f" · {len(errored)} skipped (no data)" if errored else ""))
+
+        if scored:
+            n_buy  = sum(1 for r in scored if r["decision"].action == "BUY")
+            n_sell = sum(1 for r in scored if r["decision"].action == "SELL")
+            n_hold = len(scored) - n_buy - n_sell
+            m = st.columns(3)
+            m[0].metric("🟢 BUY",  n_buy)
+            m[1].metric("🟡 HOLD", n_hold)
+            m[2].metric("🔴 SELL", n_sell)
+
+            # Rank: BUYs first (highest conviction on top), then HOLD, then SELL.
+            order = {"BUY": 0, "HOLD": 1, "SELL": 2}
+            ranked = sorted(
+                scored, key=lambda r: (order[r["decision"].action], -r["decision"].confidence))
+
+            table = pd.DataFrame([{
+                "Ticker":     r["ticker"],
+                "Name":       r["name"],
+                "Verdict":    r["decision"].action,
+                "Conviction": f"{r['decision'].confidence:.0f}%",
+                "Votes":      r["decision"].vote_summary,
+                "Weight":     f"{r['weight_pct']:.2f}%" if r.get("weight_pct") is not None else "—",
+            } for r in ranked])
+            st.dataframe(table, use_container_width=True, hide_index=True)
+
+            st.caption("Per-holding jury detail:")
+            for r in ranked:
+                d = r["decision"]
+                icon = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(d.action, "⚪")
+                with st.expander(f"{icon} {r['ticker']} · {r['name']} — {d.action} ({d.confidence:.0f}%)"):
+                    st.markdown(f"**{d.reasoning}**")
+                    st.caption(d.vote_summary)
+                    cols = st.columns(len(r["verdicts"]))
+                    for v, col in zip(r["verdicts"], cols):
+                        card_cls  = f"verdict-{v.action.lower()}"
+                        badge_cls = f"badge-{v.action.lower()}"
+                        factors_li = "".join(f"<li>{f}</li>" for f in v.key_factors)
+                        col.markdown(
+                            f"""<div class="verdict-card {card_cls}">
+                            <b>{v.agent_name}</b><br/>
+                            <span class="{badge_cls}">{v.action}</span>&nbsp;
+                            <small><b>{v.confidence}%</b></small>
+                            <hr style="margin:6px 0"/>
+                            <small>{v.reasoning}</small>
+                            <ul style="margin:4px 0 4px 0;padding-left:16px;font-size:0.8em">{factors_li}</ul>
+                            </div>""",
+                            unsafe_allow_html=True,
+                        )
+        else:
+            st.warning("No holdings could be analyzed — Yahoo returned no usable data for them.")
+
     # ── Render results from session state (survives any rerun) ─────────
-    if "analysis" not in st.session_state:
-        st.info("Enter a stock ticker and click **Convene Jury** to start analysis.")
-    else:
+    if "analysis" not in st.session_state and "index_analysis" not in st.session_state:
+        st.info("Search a stock or index fund, then click **Convene Jury** to start analysis.")
+    elif "analysis" in st.session_state:
         analysis    = st.session_state["analysis"]
         ticker      = analysis["ticker"]
         market_data = analysis["market_data"]
